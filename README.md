@@ -17,14 +17,14 @@ cd ~/Private/trading212_cli
 
 ## Auth
 
-Generate an API key pair in the Trading 212 app → Settings → API (Beta). Then:
+Generate an API token in the Trading 212 app → Settings → API (Beta). Then:
 
 ```bash
-trading212 auth demo     # stores ~/.t212/demo.{key,secret} (mode 600)
-trading212 auth live     # stores ~/.t212/live.{key,secret}
+trading212 auth demo     # stores ~/.t212/demo.token (mode 600)
+trading212 auth live     # stores ~/.t212/live.token
 ```
 
-Credentials are plain files (mode 600 in a 700 directory). No keychain.
+The token is sent as `Authorization: Bearer <token>`. Plain file storage (mode 600 in a 700 directory). No keychain.
 
 ## Quick tour
 
@@ -128,7 +128,7 @@ Pies endpoints are present in `api.json` but not wired into commands (spec marks
 
 ## Design notes
 
-- **Auth**: HTTP Basic `base64(API_KEY:API_SECRET)`.
+- **Auth**: `Authorization: Bearer <token>`.
 - **Pagination**: cursor-based; response is `{items, nextPagePath}`. `--all` follows `nextPagePath` until it's null.
 - **Errors**: 4xx/5xx bodies are parsed with `.message // .code // .error // .detail // .`, printed via `die()`.
 - **Tests**: none yet. See [PHASE0.md](PHASE0.md) for the pre-code validation transcript.

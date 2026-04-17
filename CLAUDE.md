@@ -15,7 +15,7 @@ The CLI binary is **`trading212`** (script on disk, `install.sh` symlink target,
 ```bash
 ./install.sh        # symlinks ~/bin/trading212 → ./trading212, mkdir -p ~/.t212
 trading212 --version
-trading212 auth demo    # prompts for API key + secret, writes mode-600 files
+trading212 auth demo    # prompts for API token, writes mode-600 ~/.t212/demo.token
 trading212 account summary
 ```
 
@@ -61,4 +61,4 @@ Re-fetch from `https://docs.trading212.com/_bundle/api.json?download` if stale. 
 
 ## Design decisions from Phase 0
 
-`PHASE0.md` is the pre-code validation transcript. Read it when touching auth, rate limits, pagination, or error handling — it captures *why* the current shapes are what they are (HTTP Basic forcing two credential files, `x-ratelimit-reset` being a Unix epoch and not seconds-to-wait, the `/positions/{ticker}` endpoint not existing, etc.).
+Auth is `Authorization: Bearer <token>` — one token file per env at `~/.t212/{env}.token`. Note: the OpenAPI spec defines `securitySchemes` as `authWithSecretKey` (HTTP Basic with `API_KEY:API_SECRET`) and `legacyApiKeyHeader` (raw key in `Authorization`); Bearer is a third shape we send by convention. If the server rejects Bearer on any endpoint, swap `auth_header()` back to Basic by reading two files (`.key` + `.secret`) and emitting `Basic $(printf '%s' "$key:$secret" | base64 | tr -d '\n')`. Other non-auth design decisions (cursor pagination, `x-ratelimit-reset` as Unix epoch, no `/positions/{ticker}` endpoint) are captured in the Phase 0 transcript committed earlier.
