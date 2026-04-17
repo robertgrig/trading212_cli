@@ -68,11 +68,13 @@ auth_header() {
 cmd_auth() {
   local env=${1:?'trading212 auth demo|live'}
   case "$env" in demo|live) ;; *) die "unknown env: $env" ;; esac
-  local key secret
+  local key="" secret=""
   printf 'Trading 212 API Key for %s: ' "$env" >&2
-  IFS= read -rs key && printf '\n' >&2
+  IFS= read -rs key || die "aborted: no input on stdin"
+  printf '\n' >&2
   printf 'Trading 212 API Secret for %s: ' "$env" >&2
-  IFS= read -rs secret && printf '\n' >&2
+  IFS= read -rs secret || die "aborted: no input on stdin"
+  printf '\n' >&2
   [[ -z $key || -z $secret ]] && die "empty key or secret"
   umask 077
   printf '%s' "$key" > "$T212_HOME/$env.key"
@@ -176,7 +178,8 @@ confirm_live() {
   printf '!! %s %s\n' "$method" "$path" >&2
   [[ -n $body ]] && printf '!! %s\n' "$body" >&2
   printf "Type 'yes' to continue: " >&2
-  local reply; IFS= read -r reply
+  local reply=""
+  IFS= read -r reply || die "aborted: no input on stdin (set T212_YES=1 + T212_NONINTERACTIVE=1 to bypass)"
   [[ $reply == yes ]] || die "aborted by user"
 }
 
