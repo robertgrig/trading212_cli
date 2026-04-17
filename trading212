@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# trading212 — Trading 212 Public API CLI
+# See https://docs.trading212.com/api
+#
+# openapi-version: v0 (2026-04-18)
+
+set -eo pipefail
+
+VERSION="0.1.0"
+
+T212_HOME="${T212_HOME:-$HOME/.t212}"
+mkdir -p "$T212_HOME" 2>/dev/null || true
+chmod 700 "$T212_HOME" 2>/dev/null || true
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || stat -f %N "$0")")" && pwd)"
+API_JSON="${T212_API_JSON:-$SCRIPT_DIR/api.json}"
+[[ -f $API_JSON ]] || API_JSON="$T212_HOME/api.json"
+
+# ---------- output + errors ----------
+
+die() { printf 'trading212: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+need curl; need jq
+
+# ---------- env + auth ----------
+
+resolve_env() {
+  # Highest wins: explicit flag in $T212_FLAG_ENV, then T212_ENV, then default demo.
+  local e="${T212_FLAG_ENV:-${T212_ENV:-demo}}"
+  case "$e" in
+    demo|live) printf '%s' "$e" ;;
+    *) die "invalid env: $e (want demo|live)" ;;
+  esac
+}
+
+base_url() {
+  case "$(resolve_env)" in
+    demo) printf 'https://demo.trading212.com/api/v0' ;;
+    live) printf 'https://live.trading212.com/api/v0' ;;
+  esac
+}
+
+auth_header() {
+  local env key secret creds
+  env=$(resolve_env)
+  key=$(cat "$T212_HOME/$env.key" 2>/dev/null) || die "no API key for $env — run: trading212 auth $env"
+  secret=$(cat "$T212_HOME/$env.secret" 2>/dev/null) || die "no API secret for $env — run: trading212 auth $env"
+  creds=$(printf '%s' "$key:$secret" | base64 | tr -d '\n')
+  printf 'Authorization: Basic %s' "$creds"
+}
+
+cmd_auth() {
+  local env=${1:?'trading212 auth demo|live'}
+  case "$env" in demo|live) ;; *) die "unknown env: $env" ;; esac
+  local key secret
+  printf 'Trading 212 API Key for %s: ' "$env" >&2
+  IFS= read -rs key && printf '\n' >&2
+  printf 'Trading 212 API Secret for %s: ' "$env" >&2
+  IFS= read -rs secret && printf '\n' >&2
+  [[ -z $key || -z $secret ]] && die "empty key or secret"
+  umask 077
+  printf '%s' "$key" > "$T212_HOME/$env.key"
+  printf '%s' "$secret" > "$T212_HOME/$env.secret"
+  chmod 600 "$T212_HOME/$env.key" "$T212_HOME/$env.secret"
+  note "stored $T212_HOME/$env.{key,secret} (mode 600)"
+  # Cleanup idempotency cache opportunistically.
+  find "$T212_HOME/submitted" -type f -mmin +1440 -delete 2>/dev/null || true
+}
+
+cmd_env() {
+  printf 'env=%s base=%s\n' "$(resolve_env)" "$(base_url)"
+}
+
+# ---------- HTTP core ----------
+
+# http <METHOD> <path> [curl args...]
+# Emits response body on stdout; dies on 4xx/5xx with parsed message.
+# Retries once on 429 / ratelimit-remaining:0, sleeping until x-ratelimit-reset.
+http() {
+  local method=$1 path=$2
+  shift 2
+  local url hdrs body code remaining reset now wait auth
+  url="$(base_url)$path"
+  hdrs=$(mktemp -t trading212.hdrs.XXXXXX)
+  auth=$(auth_header)
+
+  if [[ -n ${T212_VERBOSE:-} ]]; then
+    printf '> %s %s\n' "$method" "$url" >&2
+  fi
+
+  body=$(curl -sS -X "$method" -D "$hdrs" -w '\n%{http_code}' \
+    -H "$auth" -H 'Accept: application/json' -H 'Content-Type: application/json' \
+    "$@" "$url") || { rm -f "$hdrs"; die "curl failed"; }
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+
+  remaining=$(awk 'tolower($1)=="x-ratelimit-remaining:"{print $2+0}' "$hdrs")
+  reset=$(awk 'tolower($1)=="x-ratelimit-reset:"{print $2+0}' "$hdrs")
+  rm -f "$hdrs"
+
+  if [[ $code == 429 || ( ${remaining:-1} == 0 && -n $reset ) ]]; then
+    if [[ ${T212_RETRIED:-0} == 1 ]]; then
+      die "rate limited twice in a row; giving up (reset=$reset)"
+    fi
+    now=$(date +%s)
+    wait=$(( reset > now ? reset - now : 2 ))
+    note "rate-limited; sleeping ${wait}s until reset"
+    sleep "$wait"
+    T212_RETRIED=1 http "$method" "$path" "$@"
+    return
+  fi
+
+  if (( code >= 400 )); then
+    local msg
+    msg=$(printf '%s' "$body" | jq -r '.message // .code // .error // .detail // .' 2>/dev/null)
+    die "HTTP $code: ${msg:-$body}"
+  fi
+
+  printf '%s' "$body"
+}
+
+# paginate <path>
+# Follows nextPagePath until null; emits a single JSON array on stdout.
+paginate() {
+  local path=$1 acc='[]' body next
+  while :; do
+    body=$(http GET "$path")
+    acc=$(jq --argjson a "$acc" --argjson b "$(printf '%s' "$body" | jq '.items // .')" -n '$a + $b')
+    next=$(printf '%s' "$body" | jq -r '.nextPagePath // empty')
+    [[ -z $next ]] && break
+    # nextPagePath is a full path starting with /api/v0/...
+    # Strip the /api/v0 prefix since base_url() already includes it.
+    path=${next#/api/v0}
+  done
+  printf '%s' "$acc"
+}
+
+# ---------- dry-run + confirm ----------
+
+dry_run_preview() {
+  local method=$1 path=$2 body=${3:-}
+  printf '# DRY RUN (env=%s)\n' "$(resolve_env)" >&2
+  printf 'curl -X %s %s' "$method" "$(base_url)$path" >&2
+  printf ' -H "Authorization: Basic <redacted>"' >&2
+  [[ -n $body ]] && printf ' --data %q' "$body" >&2
+  printf '\n' >&2
+}
+
+confirm_live() {
+  local method=$1 path=$2 body=${3:-}
+  [[ $(resolve_env) != live ]] && return 0
+  if [[ ${T212_YES:-0} == 1 && ${T212_NONINTERACTIVE:-0} == 1 ]]; then return 0; fi
+  printf '!! LIVE TRADING - real money at risk\n' >&2
+  printf '!! %s %s\n' "$method" "$path" >&2
+  [[ -n $body ]] && printf '!! %s\n' "$body" >&2
+  printf "Type 'yes' to continue: " >&2
+  local reply; IFS= read -r reply
+  [[ $reply == yes ]] || die "aborted by user"
+}
+
+# ---------- idempotency shim ----------
+
+# idem_check <method> <path> <body> <client_id>
+# Emits cached response if a matching submission is <60s old; else stores the
+# call after the caller succeeds via idem_record.
+IDEM_HASH=""
+idem_check() {
+  [[ -z ${4:-} ]] && { IDEM_HASH=""; return 0; }
+  local hash cache
+  hash=$(printf '%s\n%s\n%s\n%s\n%s' "$(resolve_env)" "$1" "$2" "$3" "$4" | shasum -a 256 | awk '{print $1}')
+  IDEM_HASH=$hash
+  cache="$T212_HOME/submitted/$hash"
+  [[ -f $cache ]] || return 0
+  local age; age=$(( $(date +%s) - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache") ))
+  if (( age < 60 )); then
+    note "duplicate submission detected (age=${age}s, hash=$hash); replaying cached response"
+    cat "$cache"
+    exit 0
+  fi
+}
+
+idem_record() {
+  [[ -z $IDEM_HASH ]] && return 0
+  mkdir -p "$T212_HOME/submitted"
+  printf '%s' "$1" > "$T212_HOME/submitted/$IDEM_HASH"
+}
+
+# ---------- schema ----------
+
+cmd_schema() {
+  [[ -f $API_JSON ]] || die "api.json not found at $API_JSON"
+  if [[ $# -eq 0 ]]; then
+    jq -r '.paths | to_entries[] | .key as $p | .value | to_entries[] | "\(.key|ascii_upcase)\t\($p)\t\(.value.summary // .value.operationId // "")"' "$API_JSON" \
+      | column -ts $'\t'
+    return
+  fi
+  if [[ $1 == --json ]]; then
+    cat "$API_JSON"
+    return
+  fi
+  local method=${1,,} path=${2:?'trading212 schema METHOD /path'}
+  jq --arg m "$method" --arg p "$path" '.paths[$p][$m] // error("not found")' "$API_JSON"
+}
+
+# ---------- reads ----------
+
+cmd_account_summary() { http GET /equity/account/summary | jq .; }
+
+cmd_instruments_list() {
+  if [[ ${1:-} == --all ]]; then paginate /equity/metadata/instruments | jq .
+  else http GET /equity/metadata/instruments | jq .; fi
+}
+cmd_instruments_search() {
+  local q=${1:?'trading212 instruments search <query>'}
+  http GET /equity/metadata/instruments | jq --arg q "$q" '[.[] | select(
+    (.ticker // "" | ascii_downcase | contains($q|ascii_downcase)) or
+    (.name   // "" | ascii_downcase | contains($q|ascii_downcase)) or
+    (.shortName // "" | ascii_downcase | contains($q|ascii_downcase)))]'
+}
+
+cmd_exchanges_list() { http GET /equity/metadata/exchanges | jq .; }
+
+cmd_positions_list() { http GET /equity/positions | jq .; }
+cmd_positions_show() {
+  local t=${1:?'trading212 positions show <ticker>'}
+  http GET /equity/positions | jq --arg t "$t" '[.[] | select(.ticker == $t)][0] // error("no position for " + $t)'
+}
+
+cmd_orders_list() { http GET /equity/orders | jq .; }
+cmd_orders_show() {
+  local id=${1:?'trading212 orders show <id>'}
+  http GET "/equity/orders/$id" | jq .
+}
+
+cmd_history_orders()       { _history_cmd /equity/history/orders       "$@"; }
+cmd_history_dividends()    { _history_cmd /equity/history/dividends    "$@"; }
+cmd_history_transactions() { _history_cmd /equity/history/transactions "$@"; }
+_history_cmd() {
+  local path=$1; shift
+  local all=0 limit="" ticker=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --all) all=1; shift ;;
+      --limit) limit=$2; shift 2 ;;
+      --ticker) ticker=$2; shift 2 ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  local qs=""
+  [[ -n $limit  ]] && qs+="&limit=$limit"
+  [[ -n $ticker ]] && qs+="&ticker=$ticker"
+  qs=${qs:+"?${qs#&}"}
+  if (( all )); then paginate "$path$qs" | jq .
+  else http GET "$path$qs" | jq .; fi
+}
+
+cmd_exports_list()   { http GET /equity/history/exports | jq .; }
+cmd_exports_request(){
+  # body: { dataIncluded: { includeDividends, includeInterest, includeOrders, includeTransactions }, timeFrom, timeTo }
+  local body='{}'
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --from) body=$(jq --arg v "$2" '.timeFrom=$v' <<<"$body"); shift 2 ;;
+      --to)   body=$(jq --arg v "$2" '.timeTo=$v' <<<"$body"); shift 2 ;;
+      --orders)        body=$(jq '.dataIncluded.includeOrders=true'        <<<"$body"); shift ;;
+      --dividends)     body=$(jq '.dataIncluded.includeDividends=true'     <<<"$body"); shift ;;
+      --interest)      body=$(jq '.dataIncluded.includeInterest=true'      <<<"$body"); shift ;;
+      --transactions)  body=$(jq '.dataIncluded.includeTransactions=true'  <<<"$body"); shift ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  _mutate POST /equity/history/exports "$body"
+}
+
+# ---------- mutations ----------
+
+# _mutate <method> <path> <body> [--client-id <id>]
+# Honors --dry-run, --live gate, idempotency shim.
+_mutate() {
+  local method=$1 path=$2 body=$3 client_id=${T212_CLIENT_ID:-}
+  if [[ ${T212_DRY_RUN:-0} == 1 ]]; then
+    dry_run_preview "$method" "$path" "$body"
+    return
+  fi
+  idem_check "$method" "$path" "$body" "$client_id"
+  confirm_live "$method" "$path" "$body"
+  local resp
+  if [[ $method == DELETE ]]; then
+    resp=$(http DELETE "$path")
+  else
+    resp=$(http "$method" "$path" --data "$body")
+  fi
+  idem_record "$resp"
+  printf '%s\n' "$resp" | jq . 2>/dev/null || printf '%s\n' "$resp"
+}
+
+# Build order body. $1 = ticker, $2 = qty (signed), plus optional price/stop/tif.
+_order_body() {
+  local ticker=$1 qty=$2 price=${3:-} stop=${4:-} tif=${5:-GTC}
+  local body
+  body=$(jq -n --arg t "$ticker" --argjson q "$qty" --arg tif "$tif" \
+    '{ ticker:$t, quantity:$q, timeValidity:$tif }')
+  [[ -n $price ]] && body=$(printf '%s' "$body" | jq --argjson p "$price" '.limitPrice = $p')
+  [[ -n $stop  ]] && body=$(printf '%s' "$body" | jq --argjson s "$stop"  '.stopPrice  = $s')
+  printf '%s' "$body"
+}
+
+cmd_orders_buy() {
+  local ticker=${1:?'trading212 orders buy <ticker> <qty>'} qty=${2:?'qty required'}
+  [[ $qty =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || die "qty must be numeric"
+  local body; body=$(_order_body "$ticker" "$qty")
+  _mutate POST /equity/orders/market "$body"
+}
+cmd_orders_sell() {
+  local ticker=${1:?'trading212 orders sell <ticker> <qty>'} qty=${2:?'qty required'}
+  [[ $qty =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "qty must be a positive number (CLI flips sign for sell)"
+  local body; body=$(_order_body "$ticker" "-$qty")
+  _mutate POST /equity/orders/market "$body"
+}
+cmd_orders_limit() {
+  local ticker=${1:?'trading212 orders limit <ticker> <qty> --price P [--tif]'} qty=${2:?'qty required'}
+  shift 2
+  local price="" tif="GTC"
+  while [[ $# -gt 0 ]]; do case $1 in
+    --price) price=$2; shift 2 ;;
+    --tif) tif=$2; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac; done
+  [[ -n $price ]] || die "--price required"
+  local body; body=$(_order_body "$ticker" "$qty" "$price" "" "$tif")
+  _mutate POST /equity/orders/limit "$body"
+}
+cmd_orders_stop() {
+  local ticker=${1:?'trading212 orders stop <ticker> <qty> --stop S [--tif]'} qty=${2:?'qty required'}
+  shift 2
+  local stop="" tif="GTC"
+  while [[ $# -gt 0 ]]; do case $1 in
+    --stop) stop=$2; shift 2 ;;
+    --tif) tif=$2; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac; done
+  [[ -n $stop ]] || die "--stop required"
+  local body; body=$(_order_body "$ticker" "$qty" "" "$stop" "$tif")
+  _mutate POST /equity/orders/stop "$body"
+}
+cmd_orders_stop_limit() {
+  local ticker=${1:?'trading212 orders stop-limit <ticker> <qty> --stop S --price P [--tif]'} qty=${2:?'qty required'}
+  shift 2
+  local stop="" price="" tif="GTC"
+  while [[ $# -gt 0 ]]; do case $1 in
+    --stop) stop=$2; shift 2 ;;
+    --price) price=$2; shift 2 ;;
+    --tif) tif=$2; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac; done
+  [[ -n $stop && -n $price ]] || die "--stop and --price required"
+  local body; body=$(_order_body "$ticker" "$qty" "$price" "$stop" "$tif")
+  _mutate POST /equity/orders/stop_limit "$body"
+}
+cmd_orders_cancel() {
+  local id=${1:?'trading212 orders cancel <id>'}
+  _mutate DELETE "/equity/orders/$id" ""
+}
+
+# ---------- top-level argument parsing ----------
+
+# Strip out global flags before dispatch; set env vars the helpers read.
+parse_globals() {
+  local out=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --live) T212_FLAG_ENV=live ;;
+      --demo) T212_FLAG_ENV=demo ;;
+      --dry-run) T212_DRY_RUN=1 ;;
+      --yes) T212_YES=1 ;;
+      -v|--verbose) T212_VERBOSE=1 ;;
+      --client-id) T212_CLIENT_ID=$2; shift ;;
+      --safe) T212_CLIENT_ID=$(uuidgen 2>/dev/null || date +%s%N) ;;
+      --version) printf 'trading212 %s\n' "$VERSION"; exit 0 ;;
+      -h|--help) usage; exit 0 ;;
+      *) out+=("$1") ;;
+    esac
+    shift
+  done
+  export T212_FLAG_ENV T212_DRY_RUN T212_YES T212_VERBOSE T212_CLIENT_ID
+  ARGS=("${out[@]}")
+}
+
+usage() {
+  cat >&2 <<EOF
+trading212 — Trading 212 Public API CLI (v$VERSION)
+
+Usage:
+  trading212 auth demo | auth live                    Store API key+secret for env
+  trading212 env                                      Show active env + base URL
+  trading212 schema [METHOD PATH | --json]            Inspect bundled OpenAPI
+
+  trading212 account summary                          Account summary
+  trading212 instruments list [--all]
+  trading212 instruments search <q>                   Client-side filter
+  trading212 exchanges list
+  trading212 positions list
+  trading212 positions show <ticker>
+  trading212 orders list                              Pending orders
+  trading212 orders show <id>
+
+  trading212 history orders       [--all] [--limit N] [--ticker T]
+  trading212 history dividends    [--all] [--limit N] [--ticker T]
+  trading212 history transactions [--all] [--limit N]
+  trading212 exports list
+  trading212 exports request --orders --dividends --interest --transactions --from ISO --to ISO
+
+  trading212 orders buy  <ticker> <qty>
+  trading212 orders sell <ticker> <qty>
+  trading212 orders limit      <ticker> <qty> --price P [--tif GTC|DAY]
+  trading212 orders stop       <ticker> <qty> --stop S  [--tif GTC|DAY]
+  trading212 orders stop-limit <ticker> <qty> --stop S --price P [--tif GTC|DAY]
+  trading212 orders cancel <id>
+
+Global flags:
+  --demo | --live         Pick env (overrides \$T212_ENV; default demo)
+  --dry-run               Print curl but do not send (mutations only)
+  --yes                   Skip live-trade prompt (requires T212_NONINTERACTIVE=1 too)
+  --client-id <id> | --safe   Idempotency shim for mutations
+  -v, --verbose           Echo method + URL
+  --version
+  -h, --help
+EOF
+}
+
+main() {
+  parse_globals "$@"
+  set -- "${ARGS[@]}"
+  [[ $# -eq 0 ]] && { usage; exit 1; }
+  local resource=$1 action=${2:-}; shift || true; shift || true
+
+  case "$resource:$action" in
+    auth:demo|auth:live) cmd_auth "$action" ;;
+    env:)                cmd_env ;;
+    schema:)             cmd_schema ;;
+    schema:*)            cmd_schema "$action" "$@" ;;
+
+    account:summary)     cmd_account_summary ;;
+
+    instruments:list)    cmd_instruments_list "$@" ;;
+    instruments:search)  cmd_instruments_search "$@" ;;
+    exchanges:list)      cmd_exchanges_list ;;
+
+    positions:list)      cmd_positions_list ;;
+    positions:show)      cmd_positions_show "$@" ;;
+
+    orders:list)         cmd_orders_list ;;
+    orders:show)         cmd_orders_show "$@" ;;
+    orders:buy)          cmd_orders_buy "$@" ;;
+    orders:sell)         cmd_orders_sell "$@" ;;
+    orders:limit)        cmd_orders_limit "$@" ;;
+    orders:stop)         cmd_orders_stop "$@" ;;
+    orders:stop-limit)   cmd_orders_stop_limit "$@" ;;
+    orders:cancel)       cmd_orders_cancel "$@" ;;
+
+    history:orders)       cmd_history_orders "$@" ;;
+    history:dividends)    cmd_history_dividends "$@" ;;
+    history:transactions) cmd_history_transactions "$@" ;;
+    exports:list)         cmd_exports_list ;;
+    exports:request)      cmd_exports_request "$@" ;;
+
+    *) usage; die "unknown command: $resource $action" ;;
+  esac
+}
+
+main "$@"
