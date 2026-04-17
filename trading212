@@ -43,25 +43,30 @@ base_url() {
 }
 
 auth_header() {
-  local env token
+  local env key secret creds
   env=$(resolve_env)
-  token=$(cat "$T212_HOME/$env.token" 2>/dev/null) || die "no API token for $env — run: trading212 auth $env"
-  printf 'Authorization: Bearer %s' "$token"
+  key=$(cat "$T212_HOME/$env.key" 2>/dev/null) || die "no API key for $env — run: trading212 auth $env"
+  secret=$(cat "$T212_HOME/$env.secret" 2>/dev/null) || die "no API secret for $env — run: trading212 auth $env"
+  creds=$(printf '%s' "$key:$secret" | base64 | tr -d '\n')
+  printf 'Authorization: Basic %s' "$creds"
 }
 
 cmd_auth() {
   local env=${1:?'trading212 auth demo|live'}
   case "$env" in demo|live) ;; *) die "unknown env: $env" ;; esac
-  local token
-  printf 'Trading 212 API Token for %s: ' "$env" >&2
-  IFS= read -rs token && printf '\n' >&2
-  [[ -z $token ]] && die "empty token"
+  local key secret
+  printf 'Trading 212 API Key for %s: ' "$env" >&2
+  IFS= read -rs key && printf '\n' >&2
+  printf 'Trading 212 API Secret for %s: ' "$env" >&2
+  IFS= read -rs secret && printf '\n' >&2
+  [[ -z $key || -z $secret ]] && die "empty key or secret"
   umask 077
-  printf '%s' "$token" > "$T212_HOME/$env.token"
-  chmod 600 "$T212_HOME/$env.token"
-  note "stored $T212_HOME/$env.token (mode 600)"
-  # Remove any legacy Basic-auth key+secret files from an earlier auth scheme.
-  rm -f "$T212_HOME/$env.key" "$T212_HOME/$env.secret"
+  printf '%s' "$key" > "$T212_HOME/$env.key"
+  printf '%s' "$secret" > "$T212_HOME/$env.secret"
+  chmod 600 "$T212_HOME/$env.key" "$T212_HOME/$env.secret"
+  note "stored $T212_HOME/$env.{key,secret} (mode 600)"
+  # Remove any legacy single-token file from an earlier Bearer-auth attempt.
+  rm -f "$T212_HOME/$env.token"
   # Cleanup idempotency cache opportunistically.
   find "$T212_HOME/submitted" -type f -mmin +1440 -delete 2>/dev/null || true
 }
@@ -139,7 +144,7 @@ dry_run_preview() {
   local method=$1 path=$2 body=${3:-}
   printf '# DRY RUN (env=%s)\n' "$(resolve_env)" >&2
   printf 'curl -X %s %s' "$method" "$(base_url)$path" >&2
-  printf ' -H "Authorization: Bearer <redacted>"' >&2
+  printf ' -H "Authorization: Basic <redacted>"' >&2
   [[ -n $body ]] && printf ' --data %q' "$body" >&2
   printf '\n' >&2
 }
@@ -389,7 +394,7 @@ usage() {
 trading212 — Trading 212 Public API CLI (v$VERSION)
 
 Usage:
-  trading212 auth demo | auth live                    Store API token for env
+  trading212 auth demo | auth live                    Store API key+secret for env
   trading212 env                                      Show active env + base URL
   trading212 schema [METHOD PATH | --json]            Inspect bundled OpenAPI
 
