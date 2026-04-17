@@ -227,7 +227,10 @@ cmd_exchanges_list() { http GET /equity/metadata/exchanges | jq .; }
 cmd_positions_list() { http GET /equity/positions | jq .; }
 cmd_positions_show() {
   local t=${1:?'trading212 positions show <ticker>'}
-  http GET /equity/positions | jq --arg t "$t" '[.[] | select(.ticker == $t)][0] // error("no position for " + $t)'
+  http GET /equity/positions | jq --arg t "$t" '
+    [.[] | select((.ticker // .instrument.ticker) == $t)][0]
+    // error("no position for " + $t)
+  '
 }
 
 cmd_orders_list() { http GET /equity/orders | jq .; }

@@ -131,7 +131,7 @@ Pies endpoints are present in `api.json` but not wired into commands (spec marks
 - **Auth**: `Authorization: Basic base64(API_KEY:API_SECRET)`.
 - **Pagination**: cursor-based; response is `{items, nextPagePath}`. `--all` follows `nextPagePath` until it's null.
 - **Errors**: 4xx/5xx bodies are parsed with `.message // .code // .error // .detail // .`, printed via `die()`.
-- **Tests**: none yet. See [PHASE0.md](PHASE0.md) for the pre-code validation transcript.
+- **Tests**: none yet.
 
 ## License
 
