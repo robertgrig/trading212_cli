@@ -183,21 +183,24 @@ confirm_live() {
 # ---------- idempotency shim ----------
 
 # idem_check <method> <path> <body> <client_id>
-# Emits cached response if a matching submission is <60s old; else stores the
-# call after the caller succeeds via idem_record.
+# Sets IDEM_HASH for later recording. If a matching submission is <60s old,
+# replays the cached response on stdout and sets IDEM_REPLAYED=1 so _mutate
+# knows to return early — control flow stays in the caller.
 IDEM_HASH=""
+IDEM_REPLAYED=0
 idem_check() {
-  [[ -z ${4:-} ]] && { IDEM_HASH=""; return 0; }
-  local hash cache
+  IDEM_HASH=""; IDEM_REPLAYED=0
+  [[ -z ${4:-} ]] && return 0
+  local hash cache age
   hash=$(printf '%s\n%s\n%s\n%s\n%s' "$(resolve_env)" "$1" "$2" "$3" "$4" | shasum -a 256 | awk '{print $1}')
   IDEM_HASH=$hash
   cache="$T212_HOME/submitted/$hash"
   [[ -f $cache ]] || return 0
-  local age; age=$(( $(date +%s) - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache") ))
+  age=$(( $(date +%s) - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache") ))
   if (( age < 60 )); then
     note "duplicate submission detected (age=${age}s, hash=$hash); replaying cached response"
     cat "$cache"
-    exit 0
+    IDEM_REPLAYED=1
   fi
 }
 
@@ -205,6 +208,9 @@ idem_record() {
   [[ -z $IDEM_HASH ]] && return 0
   mkdir -p "$T212_HOME/submitted"
   printf '%s' "$1" > "$T212_HOME/submitted/$IDEM_HASH"
+  # Opportunistic prune: ~1/20 writes sweep entries older than 24h, keeping
+  # the cache bounded for heavy traders without a per-call find on every mutation.
+  (( RANDOM % 20 == 0 )) && find "$T212_HOME/submitted" -type f -mmin +1440 -delete 2>/dev/null || true
 }
 
 # ---------- schema ----------
@@ -271,6 +277,8 @@ _history_cmd() {
       *) die "unknown arg: $1" ;;
     esac
   done
+  # transactions endpoint doesn't support the ticker filter server-side.
+  [[ -n $ticker && $path == *transactions ]] && die "--ticker is not supported by history transactions"
   local qs=""
   [[ -n $limit  ]] && qs+="&limit=$limit"
   [[ -n $ticker ]] && qs+="&ticker=$ticker"
@@ -323,6 +331,7 @@ _mutate() {
     return
   fi
   idem_check "$method" "$path" "$body" "$client_id"
+  (( IDEM_REPLAYED )) && return 0
   confirm_live "$method" "$path" "$body"
   local resp
   if [[ $method == DELETE ]]; then
@@ -349,19 +358,6 @@ _order_body() {
   '
 }
 
-# Shared flag parser for limit/stop/stop-limit. Fills caller-local price/stop/tif
-# via nameref. Each caller asserts its own required-field check after.
-_parse_order_flags() {
-  local -n _price=$1 _stop=$2 _tif=$3; shift 3
-  _tif=${_tif:-GTC}
-  while [[ $# -gt 0 ]]; do case $1 in
-    --price) _price=$2; shift 2 ;;
-    --stop)  _stop=$2;  shift 2 ;;
-    --tif)   _tif=$2;   shift 2 ;;
-    *) die "unknown arg: $1" ;;
-  esac; done
-}
-
 cmd_orders_buy() {
   local ticker=${1:?'trading212 orders buy <ticker> <qty>'} qty=${2:?'qty required'}
   [[ $qty =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "qty must be a positive number"
@@ -372,24 +368,41 @@ cmd_orders_sell() {
   [[ $qty =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "qty must be a positive number (CLI flips sign for sell)"
   _mutate POST /equity/orders/market "$(_order_body "$ticker" "-$qty")"
 }
+# limit / stop / stop-limit parse flags inline (bash 3.2-compatible; nameref is 4.3+).
 cmd_orders_limit() {
   local ticker=${1:?'trading212 orders limit <ticker> <qty> --price P [--tif]'} qty=${2:?'qty required'}
-  shift 2; local price="" stop="" tif=""
-  _parse_order_flags price stop tif "$@"
+  shift 2
+  local price="" tif="GTC"
+  while [[ $# -gt 0 ]]; do case $1 in
+    --price) price=$2; shift 2 ;;
+    --tif)   tif=$2;   shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac; done
   [[ -n $price ]] || die "--price required"
   _mutate POST /equity/orders/limit "$(_order_body "$ticker" "$qty" "$price" "" "$tif")"
 }
 cmd_orders_stop() {
   local ticker=${1:?'trading212 orders stop <ticker> <qty> --stop S [--tif]'} qty=${2:?'qty required'}
-  shift 2; local price="" stop="" tif=""
-  _parse_order_flags price stop tif "$@"
+  shift 2
+  local stop="" tif="GTC"
+  while [[ $# -gt 0 ]]; do case $1 in
+    --stop) stop=$2; shift 2 ;;
+    --tif)  tif=$2;  shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac; done
   [[ -n $stop ]] || die "--stop required"
   _mutate POST /equity/orders/stop "$(_order_body "$ticker" "$qty" "" "$stop" "$tif")"
 }
 cmd_orders_stop_limit() {
   local ticker=${1:?'trading212 orders stop-limit <ticker> <qty> --stop S --price P [--tif]'} qty=${2:?'qty required'}
-  shift 2; local price="" stop="" tif=""
-  _parse_order_flags price stop tif "$@"
+  shift 2
+  local stop="" price="" tif="GTC"
+  while [[ $# -gt 0 ]]; do case $1 in
+    --stop)  stop=$2;  shift 2 ;;
+    --price) price=$2; shift 2 ;;
+    --tif)   tif=$2;   shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac; done
   [[ -n $stop && -n $price ]] || die "--stop and --price required"
   _mutate POST /equity/orders/stop_limit "$(_order_body "$ticker" "$qty" "$price" "$stop" "$tif")"
 }
