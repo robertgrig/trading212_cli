@@ -97,17 +97,18 @@ http() {
     "$@" "$url") || { rm -f "$hdrs"; die "curl failed"; }
   code=${body##*$'\n'}; body=${body%$'\n'*}
 
-  remaining=$(awk 'tolower($1)=="x-ratelimit-remaining:"{print $2+0}' "$hdrs")
   reset=$(awk 'tolower($1)=="x-ratelimit-reset:"{print $2+0}' "$hdrs")
   rm -f "$hdrs"
 
-  if [[ $code == 429 || ( ${remaining:-1} == 0 && -n $reset ) ]]; then
+  # Only retry on an actual 429. x-ratelimit-remaining:0 on a 200 is just a
+  # budget signal ("that was your last one for this window"), not a failure.
+  if [[ $code == 429 ]]; then
     if [[ ${T212_RETRIED:-0} == 1 ]]; then
       die "rate limited twice in a row; giving up (reset=$reset)"
     fi
     now=$(date +%s)
-    wait=$(( reset > now ? reset - now : 2 ))
-    note "rate-limited; sleeping ${wait}s until reset"
+    wait=$(( reset > now ? reset - now + 1 : 2 ))
+    note "rate-limited (429); sleeping ${wait}s until reset"
     sleep "$wait"
     T212_RETRIED=1 http "$method" "$path" "$@"
     return
