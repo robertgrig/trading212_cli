@@ -85,7 +85,7 @@ T212_NONINTERACTIVE=1 trading212 --live --yes orders buy AAPL 1
   trading212 --live orders buy AAPL 1 --safe
   ```
 
-- **Rate-limit retry** — on 429 or `x-ratelimit-remaining: 0`, the CLI sleeps until `x-ratelimit-reset` (Unix timestamp) and retries **once**. A second hit fails loudly.
+- **Rate-limit retry** — on a real 429, the CLI sleeps until `x-ratelimit-reset` (Unix timestamp) and retries **once**. A second 429 fails loudly. `x-ratelimit-remaining: 0` on a 200 is just a budget indicator and is NOT treated as a failure.
 
 ## Schema (agent-friendly)
 
@@ -132,7 +132,3 @@ Pies endpoints are present in `api.json` but not wired into commands (spec marks
 - **Pagination**: cursor-based; response is `{items, nextPagePath}`. `--all` follows `nextPagePath` until it's null.
 - **Errors**: 4xx/5xx bodies are parsed with `.message // .code // .error // .detail // .`, printed via `die()`.
 - **Tests**: none yet.
-
-## License
-
-MIT.

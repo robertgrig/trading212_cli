@@ -8,6 +8,11 @@ set -eo pipefail
 
 VERSION="0.1.0"
 
+# An inherited T212_RETRIED=1 from the parent env would suppress the very first
+# retry on 429 and cause an immediate "rate limited twice in a row" failure.
+# Reset it at script start so only internal recursion can set it.
+unset T212_RETRIED
+
 T212_HOME="${T212_HOME:-$HOME/.t212}"
 mkdir -p "$T212_HOME" 2>/dev/null || true
 chmod 700 "$T212_HOME" 2>/dev/null || true
@@ -42,13 +47,22 @@ base_url() {
   esac
 }
 
+# Cached across calls within one script invocation to avoid re-reading key+secret
+# files and re-spawning base64 on every paginate() page.
+_AUTH_CACHE_ENV=""
+_AUTH_CACHE_VAL=""
 auth_header() {
   local env key secret creds
   env=$(resolve_env)
-  key=$(cat "$T212_HOME/$env.key" 2>/dev/null) || die "no API key for $env — run: trading212 auth $env"
-  secret=$(cat "$T212_HOME/$env.secret" 2>/dev/null) || die "no API secret for $env — run: trading212 auth $env"
+  if [[ $env == "$_AUTH_CACHE_ENV" && -n $_AUTH_CACHE_VAL ]]; then
+    printf '%s' "$_AUTH_CACHE_VAL"; return
+  fi
+  key=$(<"$T212_HOME/$env.key") 2>/dev/null || die "no API key for $env — run: trading212 auth $env"
+  secret=$(<"$T212_HOME/$env.secret") 2>/dev/null || die "no API secret for $env — run: trading212 auth $env"
   creds=$(printf '%s' "$key:$secret" | base64 | tr -d '\n')
-  printf 'Authorization: Basic %s' "$creds"
+  _AUTH_CACHE_ENV=$env
+  _AUTH_CACHE_VAL="Authorization: Basic $creds"
+  printf '%s' "$_AUTH_CACHE_VAL"
 }
 
 cmd_auth() {
@@ -79,29 +93,27 @@ cmd_env() {
 
 # http <METHOD> <path> [curl args...]
 # Emits response body on stdout; dies on 4xx/5xx with parsed message.
-# Retries once on 429 / ratelimit-remaining:0, sleeping until x-ratelimit-reset.
+# Retries once on 429, sleeping until x-ratelimit-reset. x-ratelimit-remaining:0
+# on a 200 is just a budget indicator ("that was your last one for this window")
+# and is NOT treated as a failure.
 http() {
   local method=$1 path=$2
   shift 2
-  local url hdrs body code remaining reset now wait auth
+  local url hdrs body code reset now wait
   url="$(base_url)$path"
   hdrs=$(mktemp -t trading212.hdrs.XXXXXX)
-  auth=$(auth_header)
+  # Ensure the header tempfile is removed on any exit path (error, die,
+  # recursion), not just the success + 4xx paths.
+  trap 'rm -f "$hdrs"' RETURN
 
-  if [[ -n ${T212_VERBOSE:-} ]]; then
-    printf '> %s %s\n' "$method" "$url" >&2
-  fi
+  [[ -n ${T212_VERBOSE:-} ]] && printf '> %s %s\n' "$method" "$url" >&2
 
   body=$(curl -sS -X "$method" -D "$hdrs" -w '\n%{http_code}' \
-    -H "$auth" -H 'Accept: application/json' -H 'Content-Type: application/json' \
-    "$@" "$url") || { rm -f "$hdrs"; die "curl failed"; }
+    -H "$(auth_header)" -H 'Accept: application/json' -H 'Content-Type: application/json' \
+    "$@" "$url") || die "curl failed"
   code=${body##*$'\n'}; body=${body%$'\n'*}
-
   reset=$(awk 'tolower($1)=="x-ratelimit-reset:"{print $2+0}' "$hdrs")
-  rm -f "$hdrs"
 
-  # Only retry on an actual 429. x-ratelimit-remaining:0 on a 200 is just a
-  # budget signal ("that was your last one for this window"), not a failure.
   if [[ $code == 429 ]]; then
     if [[ ${T212_RETRIED:-0} == 1 ]]; then
       die "rate limited twice in a row; giving up (reset=$reset)"
@@ -125,18 +137,24 @@ http() {
 
 # paginate <path>
 # Follows nextPagePath until null; emits a single JSON array on stdout.
+# Streaming: each page's .items[] is appended as NDJSON to a tempfile, then
+# finalised with `jq -s .` once at the end. Avoids the O(n²) cost of
+# re-serialising the full accumulator each page.
 paginate() {
-  local path=$1 acc='[]' body next
+  local path=$1 body next tmp
+  tmp=$(mktemp -t trading212.page.XXXXXX)
+  trap 'rm -f "$tmp"' RETURN
   while :; do
     body=$(http GET "$path")
-    acc=$(jq --argjson a "$acc" --argjson b "$(printf '%s' "$body" | jq '.items // .')" -n '$a + $b')
+    # Emit .items[] as NDJSON; handle both envelope shapes (`.items` or a bare array).
+    printf '%s' "$body" | jq -c '(.items // .)[]' >> "$tmp"
     next=$(printf '%s' "$body" | jq -r '.nextPagePath // empty')
     [[ -z $next ]] && break
     # nextPagePath is a full path starting with /api/v0/...
     # Strip the /api/v0 prefix since base_url() already includes it.
     path=${next#/api/v0}
   done
-  printf '%s' "$acc"
+  jq -s . "$tmp"
 }
 
 # ---------- dry-run + confirm ----------
@@ -263,19 +281,34 @@ _history_cmd() {
 
 cmd_exports_list()   { http GET /equity/history/exports | jq .; }
 cmd_exports_request(){
-  # body: { dataIncluded: { includeDividends, includeInterest, includeOrders, includeTransactions }, timeFrom, timeTo }
-  local body='{}'
+  # Collect flags into shell vars, then build the body in a single jq pass.
+  local from="" to="" orders=false divs=false interest=false tx=false
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --from) body=$(jq --arg v "$2" '.timeFrom=$v' <<<"$body"); shift 2 ;;
-      --to)   body=$(jq --arg v "$2" '.timeTo=$v' <<<"$body"); shift 2 ;;
-      --orders)        body=$(jq '.dataIncluded.includeOrders=true'        <<<"$body"); shift ;;
-      --dividends)     body=$(jq '.dataIncluded.includeDividends=true'     <<<"$body"); shift ;;
-      --interest)      body=$(jq '.dataIncluded.includeInterest=true'      <<<"$body"); shift ;;
-      --transactions)  body=$(jq '.dataIncluded.includeTransactions=true'  <<<"$body"); shift ;;
+      --from)          from=$2; shift 2 ;;
+      --to)            to=$2;   shift 2 ;;
+      --orders)        orders=true;        shift ;;
+      --dividends)     divs=true;          shift ;;
+      --interest)      interest=true;      shift ;;
+      --transactions)  tx=true;            shift ;;
       *) die "unknown arg: $1" ;;
     esac
   done
+  local body; body=$(jq -n \
+    --arg from "$from" --arg to "$to" \
+    --argjson orders "$orders" --argjson divs "$divs" \
+    --argjson interest "$interest" --argjson tx "$tx" '
+    {
+      dataIncluded: {
+        includeOrders:       $orders,
+        includeDividends:    $divs,
+        includeInterest:     $interest,
+        includeTransactions: $tx,
+      },
+    }
+    + (if $from != "" then {timeFrom:$from} else {} end)
+    + (if $to   != "" then {timeTo:  $to}   else {} end)
+  ')
   _mutate POST /equity/history/exports "$body"
 }
 
@@ -301,68 +334,64 @@ _mutate() {
   printf '%s\n' "$resp" | jq . 2>/dev/null || printf '%s\n' "$resp"
 }
 
-# Build order body. $1 = ticker, $2 = qty (signed), plus optional price/stop/tif.
+# Build order body in a single jq invocation. Optional fields added only when
+# the caller passes a non-empty value.
+# $1 = ticker, $2 = qty (signed), $3 = limitPrice|"", $4 = stopPrice|"", $5 = tif (default GTC)
 _order_body() {
   local ticker=$1 qty=$2 price=${3:-} stop=${4:-} tif=${5:-GTC}
-  local body
-  body=$(jq -n --arg t "$ticker" --argjson q "$qty" --arg tif "$tif" \
-    '{ ticker:$t, quantity:$q, timeValidity:$tif }')
-  [[ -n $price ]] && body=$(printf '%s' "$body" | jq --argjson p "$price" '.limitPrice = $p')
-  [[ -n $stop  ]] && body=$(printf '%s' "$body" | jq --argjson s "$stop"  '.stopPrice  = $s')
-  printf '%s' "$body"
+  [[ $qty =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || die "qty must be numeric"
+  jq -n \
+    --arg t "$ticker" --argjson q "$qty" --arg tif "$tif" \
+    --arg p "$price" --arg s "$stop" '
+    { ticker:$t, quantity:$q, timeValidity:$tif }
+    + (if $p != "" then {limitPrice: ($p|tonumber)} else {} end)
+    + (if $s != "" then {stopPrice:  ($s|tonumber)} else {} end)
+  '
+}
+
+# Shared flag parser for limit/stop/stop-limit. Fills caller-local price/stop/tif
+# via nameref. Each caller asserts its own required-field check after.
+_parse_order_flags() {
+  local -n _price=$1 _stop=$2 _tif=$3; shift 3
+  _tif=${_tif:-GTC}
+  while [[ $# -gt 0 ]]; do case $1 in
+    --price) _price=$2; shift 2 ;;
+    --stop)  _stop=$2;  shift 2 ;;
+    --tif)   _tif=$2;   shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac; done
 }
 
 cmd_orders_buy() {
   local ticker=${1:?'trading212 orders buy <ticker> <qty>'} qty=${2:?'qty required'}
-  [[ $qty =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || die "qty must be numeric"
-  local body; body=$(_order_body "$ticker" "$qty")
-  _mutate POST /equity/orders/market "$body"
+  [[ $qty =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "qty must be a positive number"
+  _mutate POST /equity/orders/market "$(_order_body "$ticker" "$qty")"
 }
 cmd_orders_sell() {
   local ticker=${1:?'trading212 orders sell <ticker> <qty>'} qty=${2:?'qty required'}
   [[ $qty =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "qty must be a positive number (CLI flips sign for sell)"
-  local body; body=$(_order_body "$ticker" "-$qty")
-  _mutate POST /equity/orders/market "$body"
+  _mutate POST /equity/orders/market "$(_order_body "$ticker" "-$qty")"
 }
 cmd_orders_limit() {
   local ticker=${1:?'trading212 orders limit <ticker> <qty> --price P [--tif]'} qty=${2:?'qty required'}
-  shift 2
-  local price="" tif="GTC"
-  while [[ $# -gt 0 ]]; do case $1 in
-    --price) price=$2; shift 2 ;;
-    --tif) tif=$2; shift 2 ;;
-    *) die "unknown arg: $1" ;;
-  esac; done
+  shift 2; local price="" stop="" tif=""
+  _parse_order_flags price stop tif "$@"
   [[ -n $price ]] || die "--price required"
-  local body; body=$(_order_body "$ticker" "$qty" "$price" "" "$tif")
-  _mutate POST /equity/orders/limit "$body"
+  _mutate POST /equity/orders/limit "$(_order_body "$ticker" "$qty" "$price" "" "$tif")"
 }
 cmd_orders_stop() {
   local ticker=${1:?'trading212 orders stop <ticker> <qty> --stop S [--tif]'} qty=${2:?'qty required'}
-  shift 2
-  local stop="" tif="GTC"
-  while [[ $# -gt 0 ]]; do case $1 in
-    --stop) stop=$2; shift 2 ;;
-    --tif) tif=$2; shift 2 ;;
-    *) die "unknown arg: $1" ;;
-  esac; done
+  shift 2; local price="" stop="" tif=""
+  _parse_order_flags price stop tif "$@"
   [[ -n $stop ]] || die "--stop required"
-  local body; body=$(_order_body "$ticker" "$qty" "" "$stop" "$tif")
-  _mutate POST /equity/orders/stop "$body"
+  _mutate POST /equity/orders/stop "$(_order_body "$ticker" "$qty" "" "$stop" "$tif")"
 }
 cmd_orders_stop_limit() {
   local ticker=${1:?'trading212 orders stop-limit <ticker> <qty> --stop S --price P [--tif]'} qty=${2:?'qty required'}
-  shift 2
-  local stop="" price="" tif="GTC"
-  while [[ $# -gt 0 ]]; do case $1 in
-    --stop) stop=$2; shift 2 ;;
-    --price) price=$2; shift 2 ;;
-    --tif) tif=$2; shift 2 ;;
-    *) die "unknown arg: $1" ;;
-  esac; done
+  shift 2; local price="" stop="" tif=""
+  _parse_order_flags price stop tif "$@"
   [[ -n $stop && -n $price ]] || die "--stop and --price required"
-  local body; body=$(_order_body "$ticker" "$qty" "$price" "$stop" "$tif")
-  _mutate POST /equity/orders/stop_limit "$body"
+  _mutate POST /equity/orders/stop_limit "$(_order_body "$ticker" "$qty" "$price" "$stop" "$tif")"
 }
 cmd_orders_cancel() {
   local id=${1:?'trading212 orders cancel <id>'}
