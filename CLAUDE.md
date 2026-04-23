@@ -28,14 +28,18 @@ The script is one file organized into labeled sections. Touch-points for common 
 - **`parse_globals`** (bottom of file) strips global flags from `argv` and exports them as env vars (`T212_FLAG_ENV`, `T212_DRY_RUN`, `T212_YES`, `T212_CLIENT_ID`, `T212_VERBOSE`). Helpers read the env vars — they don't receive flags as args. If you add a new global flag, wire it here AND export it.
 - **`main`** dispatches on a `"$resource:$action"` case. Adding a command = add a `cmd_<resource>_<action>` function + one case arm. Keep the pattern.
 - **`http()`** is the only HTTP entry point — handles auth header, rate-limit retry (once, gated by `T212_RETRIED`), 4xx/5xx parsing via `.message // .code // .error // .detail // .`. Never call `curl` directly elsewhere.
-- **`paginate()`** follows `nextPagePath` until null and returns a single merged JSON array. **It strips the `/api/v0` prefix** from `nextPagePath` because `base_url()` already includes that prefix — don't "simplify" this away.
+- **`paginate()`** follows `nextPagePath` until null and returns a single merged JSON array. Two non-obvious bits to preserve: (a) it strips the `/api/v0` prefix from `nextPagePath` because `base_url()` already includes it; (b) `(.items // .)[]` handles both the `{items, nextPagePath}` envelope and bare-array responses — don't "simplify" either.
 - **`_mutate()`** is the single gate for every write. It orders: dry-run short-circuit → idempotency cache check → live-confirm prompt → `http` call → idempotency record. All POST/DELETE command functions MUST go through `_mutate`; don't call `http` directly from a write path or you'll bypass all three safeties.
+- **`_order_body`** is the single jq builder for every order body (`buy`/`sell`/`limit`/`stop`/`stop-limit`). Optional fields (`limitPrice`, `stopPrice`) are added only when non-empty. New order types should extend this helper rather than build JSON inline.
 - **`cmd_schema`** reads the vendored `api.json` with `jq`. It's the mechanism by which agents discover the API surface — keep its output stable.
 - **Credential paths and env-var names are still `T212_*` / `~/.t212/`** despite the script rename to `trading212`. Don't "fix" this to match the binary name — existing users' stored keys live there.
+- **Target shell is bash 3.2** (macOS default). No `declare -n` / nameref, no `${var,,}`, no associative arrays in new code. The order-cmd flag parsing uses inline `while/case` rather than a shared nameref helper for this reason.
 
 ### Env resolution precedence
 
 `--live`/`--demo` flag (`T212_FLAG_ENV`) > `$T212_ENV` env > default `demo`. Only `demo|live` are valid. `base_url()` returns the URL *including* `/api/v0`, so every path passed to `http`/`paginate` must start at `/equity/...`, not `/api/v0/equity/...`.
+
+`T212_HOME` (default `~/.t212`) overrides the credential/cache dir; `T212_API_JSON` overrides the `api.json` path (falls back to `$T212_HOME/api.json` if the script-local copy is missing). Useful for isolated test runs.
 
 ### Live-trade safety invariants
 
